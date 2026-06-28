@@ -10,6 +10,8 @@ const WIKI_ORIGIN: &str = "https://helldivers.wiki.gg";
 const WIKI_PAGE_URL: &str = "https://helldivers.wiki.gg/wiki/Stratagems";
 const WIKI_API_URL: &str =
     "https://helldivers.wiki.gg/api.php?action=parse&page=Stratagems&prop=text&format=json";
+const CURRENT_STRATAGEMS_SECTION: &str = "Current Stratagems";
+const MISSION_STRATAGEMS_SECTION: &str = "Mission Stratagems";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -70,8 +72,11 @@ pub async fn refresh_catalog(app_handle: &AppHandle) -> Result<StratagemCatalog,
     let html = fetch_stratagem_page_html(&client).await?;
     let items = parse_stratagems_from_html(&html)?;
 
-    if items.is_empty() {
-        return Err("No stratagems were parsed from the wiki response.".to_string());
+    if !has_complete_stratagem_sections(&items) {
+        return Err(
+            "Parsed stratagem data was incomplete; keeping the existing cached catalog."
+                .to_string(),
+        );
     }
 
     let catalog = StratagemCatalog {
@@ -157,29 +162,20 @@ fn compute_stratagem_id(command: &[String]) -> String {
 }
 
 async fn fetch_stratagem_page_html(client: &reqwest::Client) -> Result<String, String> {
-    match client.get(WIKI_PAGE_URL).send().await {
-        Ok(response) if response.status().is_success() => {
-            let html = response.text().await.map_err(|e| e.to_string())?;
-            if looks_like_cloudflare_challenge(&html) || !html.contains("mw-parser-output") {
-                log::warn!("Wiki page response looked like a challenge page, falling back to API.");
-            } else {
-                return Ok(html);
-            }
-        }
-        Ok(response) => {
-            log::warn!(
-                "Wiki page returned non-success status {}, falling back to API.",
-                response.status()
-            );
-        }
+    match fetch_stratagem_page_html_from_api(client).await {
+        Ok(html) => return Ok(html),
         Err(error) => {
             log::warn!(
-                "Failed to fetch wiki page directly, falling back to API: {}",
+                "Failed to fetch usable stratagem HTML from wiki API, falling back to page: {}",
                 error
             );
         }
     }
 
+    fetch_stratagem_page_html_from_page(client).await
+}
+
+async fn fetch_stratagem_page_html_from_api(client: &reqwest::Client) -> Result<String, String> {
     let payload = client
         .get(WIKI_API_URL)
         .send()
@@ -191,8 +187,28 @@ async fn fetch_stratagem_page_html(client: &reqwest::Client) -> Result<String, S
 
     let api_response: WikiApiResponse =
         serde_json::from_str(&payload).map_err(|e| format!("Invalid wiki API response: {}", e))?;
+    let html = api_response.parse.text.html;
 
-    Ok(api_response.parse.text.html)
+    if !is_valid_wiki_html(&html) {
+        return Err("Wiki API response did not include expected stratagem markup.".to_string());
+    }
+
+    Ok(html)
+}
+
+async fn fetch_stratagem_page_html_from_page(client: &reqwest::Client) -> Result<String, String> {
+    match client.get(WIKI_PAGE_URL).send().await {
+        Ok(response) if response.status().is_success() => {
+            let html = response.text().await.map_err(|e| e.to_string())?;
+            if is_valid_wiki_html(&html) {
+                return Ok(html);
+            }
+
+            Err("Wiki page response did not include expected stratagem markup.".to_string())
+        }
+        Ok(response) => Err(format!("Wiki page returned status {}.", response.status())),
+        Err(error) => Err(format!("Failed to fetch wiki page directly: {}", error)),
+    }
 }
 
 fn looks_like_cloudflare_challenge(html: &str) -> bool {
@@ -202,50 +218,47 @@ fn looks_like_cloudflare_challenge(html: &str) -> bool {
         || html.contains("Enable JavaScript and cookies to continue")
 }
 
+fn is_valid_wiki_html(html: &str) -> bool {
+    !looks_like_cloudflare_challenge(html) && html.contains("mw-parser-output")
+}
+
 fn parse_stratagems_from_html(html: &str) -> Result<Vec<Stratagem>, String> {
     let document = Html::parse_document(html);
     let container_selector =
         Selector::parse(".mw-parser-output").map_err(|e| format!("Invalid selector: {}", e))?;
+    let details_selector =
+        Selector::parse("details").map_err(|e| format!("Invalid selector: {}", e))?;
+    let summary_selector =
+        Selector::parse("summary").map_err(|e| format!("Invalid selector: {}", e))?;
+    let table_selector =
+        Selector::parse("table.wikitable").map_err(|e| format!("Invalid selector: {}", e))?;
     let content_root = document
         .select(&container_selector)
         .next()
         .ok_or_else(|| "Wiki response did not include .mw-parser-output".to_string())?;
 
     let mut items = Vec::new();
-    let mut current_section = String::new();
-    let mut current_category = String::new();
 
-    for child in content_root.children() {
-        let Some(element) = ElementRef::wrap(child) else {
+    for details in content_root.select(&details_selector) {
+        let Some(summary) = details.select(&summary_selector).next() else {
             continue;
         };
+        let summary_text = extract_text(&summary);
+        let Some(section) = classify_stratagem_summary(&summary_text) else {
+            continue;
+        };
+        let category = if section == MISSION_STRATAGEMS_SECTION {
+            MISSION_STRATAGEMS_SECTION.to_string()
+        } else {
+            summary_text
+        };
 
-        match element.value().name() {
-            "h2" => {
-                current_section = extract_heading_text(&element);
-                current_category.clear();
+        for table in details.select(&table_selector) {
+            if !table_has_required_columns(&table) {
+                continue;
             }
-            "h3" => {
-                current_category = extract_heading_text(&element);
-            }
-            "table"
-                if element
-                    .value()
-                    .classes()
-                    .any(|class_name| class_name == "wikitable") =>
-            {
-                if matches!(
-                    current_section.as_str(),
-                    "Current Stratagems" | "Mission Stratagems"
-                ) {
-                    items.extend(parse_stratagem_table(
-                        &element,
-                        &current_section,
-                        &current_category,
-                    ));
-                }
-            }
-            _ => {}
+
+            items.extend(parse_stratagem_table(&table, section, &category));
         }
     }
 
@@ -283,17 +296,48 @@ fn parse_stratagem_table(table: &ElementRef<'_>, section: &str, category: &str) 
             Some(Stratagem {
                 id: String::new(),
                 section: section.to_string(),
-                category: if category.is_empty() {
-                    section.to_string()
-                } else {
-                    category.to_string()
-                },
+                category: category.to_string(),
                 name,
                 icon_url: extract_image_url(&cells[icon_index]).unwrap_or_default(),
                 command,
             })
         })
         .collect()
+}
+
+fn table_has_required_columns(table: &ElementRef<'_>) -> bool {
+    let row_selector = Selector::parse("tr").expect("valid row selector");
+    let Some(header_row) = table.select(&row_selector).next() else {
+        return false;
+    };
+
+    let header_cells = direct_cells(&header_row);
+    find_column_index(&header_cells, "Icon").is_some()
+        && find_column_index(&header_cells, "Name").is_some()
+        && find_column_index(&header_cells, "Stratagem Code").is_some()
+}
+
+fn classify_stratagem_summary(summary: &str) -> Option<&'static str> {
+    let normalized_summary = normalize_whitespace(summary);
+    if normalized_summary.is_empty() {
+        return None;
+    }
+
+    if normalized_summary.eq_ignore_ascii_case(MISSION_STRATAGEMS_SECTION) {
+        Some(MISSION_STRATAGEMS_SECTION)
+    } else {
+        Some(CURRENT_STRATAGEMS_SECTION)
+    }
+}
+
+fn has_complete_stratagem_sections(items: &[Stratagem]) -> bool {
+    !items.is_empty()
+        && items
+            .iter()
+            .any(|item| item.section == CURRENT_STRATAGEMS_SECTION)
+        && items
+            .iter()
+            .any(|item| item.section == MISSION_STRATAGEMS_SECTION)
 }
 
 fn direct_cells<'a>(row: &'a ElementRef<'a>) -> Vec<ElementRef<'a>> {
@@ -310,13 +354,7 @@ fn find_column_index(cells: &[ElementRef<'_>], header_name: &str) -> Option<usiz
     })
 }
 
-fn extract_heading_text(element: &ElementRef<'_>) -> String {
-    let headline_selector = Selector::parse(".mw-headline").expect("valid headline selector");
-
-    if let Some(headline) = element.select(&headline_selector).next() {
-        return normalize_whitespace(&headline.text().collect::<Vec<_>>().join(" "));
-    }
-
+fn extract_text(element: &ElementRef<'_>) -> String {
     normalize_whitespace(&element.text().collect::<Vec<_>>().join(" "))
 }
 
@@ -325,9 +363,9 @@ fn extract_name(cell: &ElementRef<'_>) -> String {
 
     cell.select(&link_selector)
         .next()
-        .map(|link| normalize_whitespace(&link.text().collect::<Vec<_>>().join(" ")))
+        .map(|link| extract_text(&link))
         .filter(|text| !text.is_empty())
-        .unwrap_or_else(|| normalize_whitespace(&cell.text().collect::<Vec<_>>().join(" ")))
+        .unwrap_or_else(|| extract_text(cell))
 }
 
 fn extract_image_url(cell: &ElementRef<'_>) -> Option<String> {
@@ -362,11 +400,11 @@ fn extract_command(cell: &ElementRef<'_>) -> Vec<String> {
         return command;
     }
 
-    let normalized = normalize_whitespace(&cell.text().collect::<Vec<_>>().join(" "))
-        .replace('↑', " UP ")
-        .replace('↓', " DOWN ")
-        .replace('←', " LEFT ")
-        .replace('→', " RIGHT ");
+    let normalized = extract_text(cell)
+        .replace("↑", " UP ")
+        .replace("↓", " DOWN ")
+        .replace("←", " LEFT ")
+        .replace("→", " RIGHT ");
 
     for token in normalized.split_whitespace() {
         match token.to_ascii_uppercase().as_str() {
@@ -418,4 +456,115 @@ fn current_unix_timestamp() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        has_complete_stratagem_sections, parse_stratagems_from_html, Stratagem,
+        CURRENT_STRATAGEMS_SECTION, MISSION_STRATAGEMS_SECTION,
+    };
+
+    const DETAILS_FIXTURE: &str = r#"
+<div class="mw-parser-output">
+  <details>
+    <summary>Orbital Strikes</summary>
+    <table class="wikitable sortable">
+      <tbody>
+        <tr>
+          <th>Icon</th>
+          <th>Name</th>
+          <th>Stratagem Code</th>
+          <th>Base Cooldown</th>
+          <th>Source</th>
+        </tr>
+        <tr>
+          <td><img src="/images/orbital.png" /></td>
+          <td><a href="/wiki/Orbital_Precision_Strike">Orbital Precision Strike</a></td>
+          <td>
+            <img alt="Stratagem Arrow Right.svg" src="/images/right.svg" />
+            <img alt="Stratagem Arrow Right.svg" src="/images/right.svg" />
+            <img alt="Stratagem Arrow Up.svg" src="/images/up.svg" />
+          </td>
+          <td>90s</td>
+          <td>Bridge</td>
+        </tr>
+      </tbody>
+    </table>
+  </details>
+  <details>
+    <summary>Mission Stratagems</summary>
+    <table class="wikitable sortable">
+      <tbody>
+        <tr>
+          <th>Icon</th>
+          <th>Name</th>
+          <th>Stratagem Code</th>
+        </tr>
+        <tr>
+          <td><img src="/images/reinforce.png" /></td>
+          <td><a href="/wiki/Reinforce">Reinforce</a></td>
+          <td>UP DOWN RIGHT LEFT UP</td>
+        </tr>
+      </tbody>
+    </table>
+  </details>
+</div>
+"#;
+
+    #[test]
+    fn parse_stratagems_uses_details_summary_grouping() {
+        let items = parse_stratagems_from_html(DETAILS_FIXTURE).expect("fixture should parse");
+
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].section, CURRENT_STRATAGEMS_SECTION);
+        assert_eq!(items[0].category, "Orbital Strikes");
+        assert_eq!(items[1].section, MISSION_STRATAGEMS_SECTION);
+        assert_eq!(items[1].category, MISSION_STRATAGEMS_SECTION);
+    }
+
+    #[test]
+    fn parse_stratagems_extracts_direction_from_image_alt_and_text_fallback() {
+        let items = parse_stratagems_from_html(DETAILS_FIXTURE).expect("fixture should parse");
+
+        assert_eq!(items[0].command, vec!["RIGHT", "RIGHT", "UP"]);
+        assert_eq!(items[1].command, vec!["UP", "DOWN", "RIGHT", "LEFT", "UP"]);
+    }
+
+    #[test]
+    fn parse_stratagems_preserves_name_and_icon_with_extra_columns() {
+        let items = parse_stratagems_from_html(DETAILS_FIXTURE).expect("fixture should parse");
+
+        assert_eq!(items[0].name, "Orbital Precision Strike");
+        assert_eq!(
+            items[0].icon_url,
+            "https://helldivers.wiki.gg/images/orbital.png"
+        );
+    }
+
+    #[test]
+    fn completeness_check_requires_current_and_mission_sections() {
+        let current_only = vec![Stratagem {
+            id: String::new(),
+            section: CURRENT_STRATAGEMS_SECTION.to_string(),
+            category: "Orbital Strikes".to_string(),
+            name: "Orbital Precision Strike".to_string(),
+            icon_url: String::new(),
+            command: vec!["RIGHT".to_string()],
+        }];
+        let mission_only = vec![Stratagem {
+            id: String::new(),
+            section: MISSION_STRATAGEMS_SECTION.to_string(),
+            category: MISSION_STRATAGEMS_SECTION.to_string(),
+            name: "Reinforce".to_string(),
+            icon_url: String::new(),
+            command: vec!["UP".to_string()],
+        }];
+
+        assert!(!has_complete_stratagem_sections(&current_only));
+        assert!(!has_complete_stratagem_sections(&mission_only));
+        assert!(has_complete_stratagem_sections(
+            &parse_stratagems_from_html(DETAILS_FIXTURE).expect("fixture should parse")
+        ));
+    }
 }
